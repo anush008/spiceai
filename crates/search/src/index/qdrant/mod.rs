@@ -17,6 +17,7 @@ limitations under the License.
 mod write;
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -29,8 +30,10 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
 use futures::{StreamExt, TryStreamExt};
 use llms::embeddings::Embed;
+use parking_lot::Mutex;
 use qdrant::QdrantStore;
-use spice_table::{Index, WriteWindow};
+use qdrant::proto::point_id::PointIdOptions;
+use spice_table::{GroupPruning, Index, WriteWindow};
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::{MAX_CONCURRENT_INDEX_WRITES, SearchIndex, VectorIndex, embedding_col};
@@ -114,11 +117,8 @@ pub struct QdrantIndex {
 
     pub batch_write_rows: usize,
 
-    /// Payload field name that holds the partition value, when partitioning is enabled.
-    pub partition_key: Option<String>,
-
-    /// Source column the partition value is read from.
-    pub partition_column: Option<String>,
+    /// Ids written in an open [`WriteWindow::ReplaceAll`] window; the rest go when it completes.
+    pub replace_window: Arc<Mutex<Option<HashSet<String>>>>,
 }
 
 #[async_trait]
@@ -210,12 +210,6 @@ impl Index for QdrantIndex {
             }
         }
 
-        if let Some(partition_column) = &self.partition_column
-            && !cols.contains(partition_column)
-        {
-            cols.push(partition_column.clone());
-        }
-
         cols
     }
 
@@ -234,8 +228,46 @@ impl Index for QdrantIndex {
             .await
     }
 
-    async fn on_write_start(&self, _window: WriteWindow) -> Result<(), DataFusionError> {
+    async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
+        *self.replace_window.lock() = (window == WriteWindow::ReplaceAll).then(HashSet::new);
         Ok(())
+    }
+
+    async fn on_write_failed(&self) -> Result<(), DataFusionError> {
+        *self.replace_window.lock() = None;
+        Ok(())
+    }
+
+    async fn on_write_complete(&self) -> Result<(), DataFusionError> {
+        let Some(written) = self.replace_window.lock().take() else {
+            return Ok(());
+        };
+        let stale: Vec<_> = self
+            .client
+            .point_ids(&self.collection)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .into_iter()
+            .filter(|id| match &id.point_id_options {
+                Some(PointIdOptions::Uuid(uuid)) => !written.contains(uuid),
+                _ => true,
+            })
+            .collect();
+        self.client
+            .delete_by_ids(&self.collection, stale)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn write_complete_failure_is_fatal(&self) -> bool {
+        true
+    }
+
+    async fn truncate(&self) -> Result<(), DataFusionError> {
+        self.client
+            .delete_all(&self.collection)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
     async fn delete_by_keys(&self, keys: RecordBatch) -> Result<(), DataFusionError> {
@@ -243,9 +275,38 @@ impl Index for QdrantIndex {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
+
+    fn deletes_by_partial_key(&self) -> bool {
+        true
+    }
+
+    async fn delete_group_remainder(
+        &self,
+        group_columns: &[String],
+        members: RecordBatch,
+    ) -> Result<(), DataFusionError> {
+        write::delete_group_remainder(self, group_columns, &members)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn group_pruning(&self) -> GroupPruning {
+        GroupPruning::Complete
+    }
 }
 
 impl QdrantIndex {
+    fn record_written(&self, points: &[qdrant::payload::PointData]) {
+        if let Some(written) = self.replace_window.lock().as_mut() {
+            written.extend(points.iter().filter_map(|point| {
+                match point.id.as_ref()?.point_id_options.as_ref()? {
+                    PointIdOptions::Uuid(uuid) => Some(uuid.clone()),
+                    PointIdOptions::Num(_) => None,
+                }
+            }));
+        }
+    }
+
     fn metadata_fields(&self) -> Vec<Field> {
         let embedding_name = embedding_col(&self.embedded_column);
         self.metadata_columns

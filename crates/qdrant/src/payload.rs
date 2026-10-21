@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{Result, UnsupportedPayloadTypeSnafu};
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use qdrant_client::qdrant::value::Kind;
 use qdrant_client::qdrant::{ListValue, PointId, PointStruct, Value};
@@ -68,6 +68,110 @@ impl From<qdrant_client::qdrant::ScoredPoint> for SearchResult {
     }
 }
 
+/// Qdrant normalizes cosine vectors on upload; this payload value restores the original.
+pub const VECTOR_NORM_KEY: &str = "spice_vector_norm";
+
+/// Types stored as their exact string form, since Qdrant has no native value for them.
+#[must_use]
+pub fn is_string_encoded(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(..)
+    )
+}
+
+#[must_use]
+pub fn is_storable(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View => true,
+        DataType::FixedSizeList(field, _) => {
+            !matches!(field.data_type(), DataType::FixedSizeList(..))
+                && !is_string_encoded(field.data_type())
+                && is_storable(field.data_type())
+        }
+        other => is_string_encoded(other),
+    }
+}
+
+/// Casts a string-encoded column to `Utf8` for [`arrow_value_to_qdrant`].
+///
+/// # Errors
+///
+/// Returns an error when the cast fails.
+pub fn payload_column(array: &ArrayRef) -> Result<ArrayRef> {
+    if !is_string_encoded(array.data_type()) {
+        return Ok(Arc::clone(array));
+    }
+    arrow::compute::cast(array, &DataType::Utf8).map_err(|_| unsupported(array.as_ref()))
+}
+
+/// Builds a column of `data_type` from payload values.
+///
+/// # Errors
+///
+/// Returns an error when a value does not decode as `data_type`.
+pub fn payload_values_to_arrow(values: &[&Value], data_type: &DataType) -> Result<ArrayRef> {
+    if is_string_encoded(data_type) {
+        let strings: arrow::array::StringArray = values
+            .iter()
+            .map(|value| match &value.kind {
+                Some(Kind::StringValue(s)) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let options = arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        return arrow::compute::cast_with_options(&strings, data_type, &options).map_err(|e| {
+            crate::error::Error::PayloadDecode {
+                arrow_type: data_type.to_string(),
+                detail: e.to_string(),
+            }
+        });
+    }
+    if values.is_empty() {
+        return Ok(arrow::array::new_empty_array(data_type));
+    }
+    let arrays: Vec<ArrayRef> = values
+        .iter()
+        .map(|value| qdrant_value_to_arrow(value, data_type))
+        .collect();
+    let refs: Vec<&dyn Array> = arrays.iter().map(AsRef::as_ref).collect();
+    arrow::compute::concat(&refs).map_err(|e| crate::error::Error::PayloadDecode {
+        arrow_type: data_type.to_string(),
+        detail: e.to_string(),
+    })
+}
+
+fn unsupported(array: &dyn Array) -> crate::error::Error {
+    UnsupportedPayloadTypeSnafu {
+        arrow_type: format!("{:?}", array.data_type()),
+    }
+    .build()
+}
+
 /// Converts one Arrow cell into a Qdrant payload value.
 ///
 /// # Errors
@@ -81,12 +185,6 @@ pub fn arrow_value_to_qdrant(array: &dyn Array, row: usize) -> Result<Value> {
         Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray, UInt8Array,
         UInt16Array, UInt32Array, UInt64Array,
     };
-    fn unsupported(array: &dyn Array) -> crate::error::Error {
-        UnsupportedPayloadTypeSnafu {
-            arrow_type: format!("{:?}", array.data_type()),
-        }
-        .build()
-    }
     macro_rules! payload {
         ($array:expr, $ty:ty, $row:expr, $conv:expr) => {
             $array
@@ -274,9 +372,14 @@ pub fn qdrant_value_to_arrow(value: &Value, data_type: &DataType) -> arrow::arra
 }
 
 #[must_use]
-pub fn point_id_from_values(values: &[String]) -> PointId {
+pub fn point_uuid(values: &[String]) -> String {
     let name = values.join("\u{1f}");
-    PointId::from(Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()).to_string())
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
+}
+
+#[must_use]
+pub fn point_id_from_values(values: &[String]) -> PointId {
+    PointId::from(point_uuid(values))
 }
 #[cfg(test)]
 mod tests {
@@ -362,6 +465,79 @@ mod tests {
             })
             .collect();
         assert_eq!(nums, vec![3, 4]);
+    }
+
+    #[test]
+    fn string_encoded_types_round_trip_exactly() {
+        use arrow::array::{
+            Date32Array, Decimal128Array, Time64MicrosecondArray, TimestampMicrosecondArray,
+        };
+        let columns: Vec<(ArrayRef, &str)> = vec![
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![Some(1250), None])
+                        .with_precision_and_scale(12, 2)
+                        .expect("decimal"),
+                ),
+                "12.50",
+            ),
+            (
+                Arc::new(Date32Array::from(vec![Some(19_726), None])),
+                "2024-01-04",
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(1_704_112_215_123_456),
+                    None,
+                ])),
+                "2024-01-01T12:30:15.123456",
+            ),
+            (
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Some(1_704_112_215_123_456), None])
+                        .with_timezone("+05:30"),
+                ),
+                "2024-01-01T18:00:15.123456+05:30",
+            ),
+            (
+                Arc::new(Time64MicrosecondArray::from(vec![
+                    Some(45_015_123_456),
+                    None,
+                ])),
+                "12:30:15.123456",
+            ),
+        ];
+        for (column, text) in columns {
+            let encoded = payload_column(&column).expect("encode");
+            let values: Vec<Value> = (0..2)
+                .map(|row| arrow_value_to_qdrant(encoded.as_ref(), row).expect("value"))
+                .collect();
+            assert_eq!(values[0].kind, Some(Kind::StringValue(text.to_string())));
+            assert_eq!(values[1].kind, Some(Kind::NullValue(0)));
+            let refs: Vec<&Value> = values.iter().collect();
+            let decoded = payload_values_to_arrow(&refs, column.data_type()).expect("decode");
+            assert_eq!(decoded.as_ref(), column.as_ref());
+        }
+
+        let err = payload_values_to_arrow(&[&Value::from("soon")], &DataType::Date32)
+            .expect_err("a non-date string must not decode as NULL");
+        assert!(err.to_string().contains("Date32"), "{err}");
+    }
+
+    #[test]
+    fn storable_types() {
+        let item = |dt| Arc::new(Field::new("item", dt, true));
+        assert!(is_storable(&DataType::Decimal128(38, 10)));
+        assert!(is_storable(&DataType::FixedSizeList(
+            item(DataType::Float32),
+            4
+        )));
+        assert!(!is_storable(&DataType::FixedSizeList(
+            item(DataType::Date32),
+            4
+        )));
+        assert!(!is_storable(&DataType::Binary));
+        assert!(!is_storable(&DataType::List(item(DataType::Utf8))));
     }
 
     #[test]

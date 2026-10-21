@@ -364,25 +364,15 @@ fn build_payload_array(
     results: &[SearchResult],
     field: &Field,
 ) -> Result<ArrayRef, DataFusionError> {
-    let columns: Vec<ArrayRef> = results
+    let null = qdrant::proto::Value {
+        kind: Some(qdrant::proto::value::Kind::NullValue(0)),
+    };
+    let values: Vec<&qdrant::proto::Value> = results
         .iter()
-        .map(|result| {
-            let value = result
-                .payload
-                .get(field.name())
-                .unwrap_or(&qdrant::proto::Value {
-                    kind: Some(qdrant::proto::value::Kind::NullValue(0)),
-                });
-            qdrant::payload::qdrant_value_to_arrow(value, field.data_type())
-        })
+        .map(|result| result.payload.get(field.name()).unwrap_or(&null))
         .collect();
-    if columns.is_empty() {
-        return Ok(arrow::array::new_null_array(field.data_type(), 0) as ArrayRef);
-    }
-    let refs: Vec<&dyn arrow::array::Array> = columns.iter().map(AsRef::as_ref).collect();
-    let combined = arrow::compute::concat(&refs)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    Ok(combined)
+    qdrant::payload::payload_values_to_arrow(&values, field.data_type())
+        .map_err(|e| DataFusionError::External(Box::new(e)))
 }
 
 #[derive(Debug)]
@@ -601,7 +591,11 @@ impl TableProvider for QdrantListTable {
     }
 }
 
-#[expect(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "dims is positive, and the norm product restores an f32 the model produced"
+)]
 fn dense_vector(result: &SearchResult, dims: i32) -> Result<Vec<f32>, String> {
     let Some(vector) = &result.vector else {
         return Err("Qdrant search result did not include the vector".to_string());
@@ -613,7 +607,17 @@ fn dense_vector(result: &SearchResult, dims: i32) -> Result<Vec<f32>, String> {
             vector.len()
         ));
     }
-    Ok(vector.clone())
+    match result
+        .payload
+        .get(qdrant::payload::VECTOR_NORM_KEY)
+        .and_then(|value| value.kind.as_ref())
+    {
+        Some(qdrant::proto::value::Kind::DoubleValue(norm)) => Ok(vector
+            .iter()
+            .map(|&x| (f64::from(x) * norm) as f32)
+            .collect()),
+        _ => Ok(vector.clone()),
+    }
 }
 
 #[cfg(test)]

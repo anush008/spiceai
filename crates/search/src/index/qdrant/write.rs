@@ -17,8 +17,13 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
-use qdrant::payload::{PointData, arrow_value_to_qdrant, point_id_from_values};
+use qdrant::payload::{
+    PointData, VECTOR_NORM_KEY, arrow_value_to_qdrant, payload_column, point_id_from_values,
+};
+use qdrant::proto::value::Kind;
+use qdrant::proto::{Condition, Filter, Range};
 use snafu::{ResultExt, Snafu};
 use spice_table::Index;
 
@@ -65,11 +70,6 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to write to Qdrant collection '{collection}': partition column '{column}' not found in record batch."
-    ))]
-    PartitionColumnNotFound { collection: String, column: String },
-
-    #[snafu(display(
         "Failed to write to Qdrant collection '{collection}': column '{column}' has a type that cannot be stored as a Qdrant payload value. {source} \
         See: https://spiceai.org/docs/components/vector-databases"
     ))]
@@ -78,6 +78,16 @@ pub enum Error {
         column: String,
         source: qdrant::Error,
     },
+
+    #[snafu(display(
+        "Failed to delete from Qdrant collection '{collection}': the delete request names none of the index's primary key columns."
+    ))]
+    KeyColumnsMissing { collection: String },
+
+    #[snafu(display(
+        "Failed to delete from Qdrant collection '{collection}': primary key column '{column}' has a type Qdrant cannot match by value."
+    ))]
+    UnsupportedKeyType { collection: String, column: String },
 
     #[snafu(display(
         "Failed to update the search index '{collection}' (qdrant): the vectors stored for the records this write could not embed could not be removed, so a search would return them at their previous value. Cause: {source}"
@@ -137,6 +147,7 @@ pub async fn write(index: &QdrantIndex, record: RecordBatch) -> Result<RecordBat
     }
 
     if !points.is_empty() {
+        index.record_written(&points);
         index
             .client
             .upsert(collection, points, index.batch_write_rows)
@@ -177,25 +188,30 @@ fn build_points(
     for name in &metadata_names {
         payload_names.insert(name.as_str());
     }
-    if let Some(partition_key) = index.partition_key.as_deref() {
-        payload_names.insert(partition_key);
-    }
     let column_index: HashMap<&str, usize> = schema
         .fields()
         .iter()
         .enumerate()
         .map(|(i, f)| (f.name().as_str(), i))
         .collect();
-    let mut payload_columns: Vec<(&str, usize)> = payload_names
+    let mut payload_columns: Vec<(&str, ArrayRef)> = payload_names
         .into_iter()
         .filter_map(|name| {
-            if Some(name) == index.partition_key.as_deref() {
-                return None;
-            }
-            column_index.get(name).map(|&idx| (name, idx))
+            column_index
+                .get(name)
+                .map(|&idx| (name, record.column(idx)))
         })
-        .collect();
+        .map(|(name, column)| {
+            payload_column(column)
+                .map(|column| (name, column))
+                .context(PayloadConversionSnafu {
+                    collection: collection.to_string(),
+                    column: name.to_string(),
+                })
+        })
+        .collect::<Result<_>>()?;
     payload_columns.sort_unstable_by_key(|(name, _)| *name);
+    let store_norm = index.distance_metric == "cosine";
 
     let mut null_pk_skips: usize = 0;
     let mut null_pk_samples: Vec<usize> = Vec::new();
@@ -258,32 +274,21 @@ fn build_points(
 
         let mut payload: HashMap<String, qdrant::proto::Value> =
             HashMap::with_capacity(payload_columns.len() + 1);
-        for (name, idx) in &payload_columns {
-            let value = arrow_value_to_qdrant(record.column(*idx).as_ref(), row).context(
-                PayloadConversionSnafu {
+        for (name, column) in &payload_columns {
+            let value =
+                arrow_value_to_qdrant(column.as_ref(), row).context(PayloadConversionSnafu {
                     collection: collection.to_string(),
                     column: (*name).to_string(),
-                },
-            )?;
+                })?;
             payload.insert((*name).to_string(), value);
         }
-
-        if let (Some(partition_key), Some(partition_col)) =
-            (&index.partition_key, &index.partition_column)
-        {
-            let Some((idx, _)) = record.schema().column_with_name(partition_col) else {
-                return Err(Error::PartitionColumnNotFound {
-                    collection: collection.to_string(),
-                    column: partition_col.clone(),
-                });
-            };
-            let value = arrow_value_to_qdrant(record.column(idx).as_ref(), row).context(
-                PayloadConversionSnafu {
-                    collection: collection.to_string(),
-                    column: partition_col.clone(),
-                },
-            )?;
-            payload.insert(partition_key.clone(), value);
+        if store_norm {
+            let norm = embedding
+                .iter()
+                .map(|&x| f64::from(x) * f64::from(x))
+                .sum::<f64>()
+                .sqrt();
+            payload.insert(VECTOR_NORM_KEY.to_string(), norm.into());
         }
 
         let id = if index.primary_key.is_empty() {
@@ -340,19 +345,32 @@ fn build_points(
 }
 
 pub async fn delete_by_keys(index: &QdrantIndex, keys: &RecordBatch) -> Result<()> {
-    let key_strings: Vec<Option<String>> =
-        extract_and_format_primary_key(index.name(), &index.primary_key, keys)
-            .map_err(|e| Error::from(*e))?;
-
-    let ids: Vec<qdrant::proto::PointId> = key_strings
-        .into_iter()
-        .filter_map(|key| key.map(|k| point_id_from_values(&[k])))
+    let schema = keys.schema();
+    let present: Vec<&str> = index
+        .primary_key
+        .iter()
+        .map(|f| f.name().as_str())
+        .filter(|name| schema.column_with_name(name).is_some())
         .collect();
+    if present.len() < index.primary_key.len() {
+        let groups = key_groups(index, keys, &present)?;
+        return delete_groups(
+            index,
+            groups.into_values().map(|(filter, _)| (filter, vec![])),
+        )
+        .await;
+    }
 
+    let ids: Vec<qdrant::proto::PointId> =
+        extract_and_format_primary_key(index.name(), &index.primary_key, keys)
+            .map_err(|e| Error::from(*e))?
+            .into_iter()
+            .flatten()
+            .map(|key| point_id_from_values(&[key]))
+            .collect();
     if ids.is_empty() {
         return Ok(());
     }
-
     index
         .client
         .delete_by_ids(&index.collection, ids)
@@ -360,4 +378,123 @@ pub async fn delete_by_keys(index: &QdrantIndex, keys: &RecordBatch) -> Result<(
         .context(QdrantSnafu {
             collection: index.collection.clone(),
         })
+}
+
+pub async fn delete_group_remainder(
+    index: &QdrantIndex,
+    group_columns: &[String],
+    members: &RecordBatch,
+) -> Result<()> {
+    let columns: Vec<&str> = group_columns.iter().map(String::as_str).collect();
+    let groups = key_groups(index, members, &columns)?;
+    delete_groups(index, groups.into_values()).await
+}
+
+fn key_groups(
+    index: &QdrantIndex,
+    batch: &RecordBatch,
+    columns: &[&str],
+) -> Result<HashMap<String, (Filter, Vec<qdrant::proto::PointId>)>> {
+    let collection = index.collection.as_str();
+    if columns.is_empty() {
+        return KeyColumnsMissingSnafu {
+            collection: collection.to_string(),
+        }
+        .fail();
+    }
+    let schema = batch.schema();
+    let key_columns = columns
+        .iter()
+        .map(|&name| {
+            let Some((idx, _)) = schema.column_with_name(name) else {
+                return KeyColumnsMissingSnafu {
+                    collection: collection.to_string(),
+                }
+                .fail();
+            };
+            payload_column(batch.column(idx))
+                .map(|column| (name, column))
+                .context(PayloadConversionSnafu {
+                    collection: collection.to_string(),
+                    column: name.to_string(),
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ids: Vec<Option<String>> = if index
+        .primary_key
+        .iter()
+        .all(|f| schema.column_with_name(f.name()).is_some())
+    {
+        extract_and_format_primary_key(index.name(), &index.primary_key, batch)
+            .map_err(|e| Error::from(*e))?
+    } else {
+        vec![None; batch.num_rows()]
+    };
+
+    let mut groups: HashMap<String, (Filter, Vec<qdrant::proto::PointId>)> = HashMap::new();
+    'rows: for (row, id) in ids.into_iter().enumerate() {
+        let mut conditions = Vec::with_capacity(key_columns.len());
+        for (name, column) in &key_columns {
+            let value =
+                arrow_value_to_qdrant(column.as_ref(), row).context(PayloadConversionSnafu {
+                    collection: collection.to_string(),
+                    column: (*name).to_string(),
+                })?;
+            let condition = match value.kind {
+                Some(Kind::NullValue(_)) | None => continue 'rows,
+                Some(Kind::StringValue(v)) => Condition::matches(*name, v),
+                Some(Kind::IntegerValue(v)) => Condition::matches(*name, v),
+                Some(Kind::BoolValue(v)) => Condition::matches(*name, v),
+                Some(Kind::DoubleValue(v)) => Condition::range(
+                    *name,
+                    Range {
+                        gte: Some(v),
+                        lte: Some(v),
+                        ..Default::default()
+                    },
+                ),
+                Some(_) => {
+                    return UnsupportedKeyTypeSnafu {
+                        collection: collection.to_string(),
+                        column: (*name).to_string(),
+                    }
+                    .fail();
+                }
+            };
+            conditions.push(condition);
+        }
+        let group = groups
+            .entry(format!("{conditions:?}"))
+            .or_insert_with(|| (Filter::must(conditions), Vec::new()));
+        if let Some(id) = id {
+            group.1.push(point_id_from_values(&[id]));
+        }
+    }
+    Ok(groups)
+}
+
+async fn delete_groups(
+    index: &QdrantIndex,
+    groups: impl IntoIterator<Item = (Filter, Vec<qdrant::proto::PointId>)>,
+) -> Result<()> {
+    const GROUPS_PER_REQUEST: usize = 256;
+    let groups: Vec<_> = groups.into_iter().collect();
+    for chunk in groups.chunks(GROUPS_PER_REQUEST) {
+        let keep: Vec<qdrant::proto::PointId> = chunk
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().cloned())
+            .collect();
+        let mut filter = Filter::should(chunk.iter().map(|(group, _)| group.clone().into()));
+        if !keep.is_empty() {
+            filter.must_not.push(Condition::has_id(keep));
+        }
+        index
+            .client
+            .delete_by_filter(&index.collection, filter)
+            .await
+            .context(QdrantSnafu {
+                collection: index.collection.clone(),
+            })?;
+    }
+    Ok(())
 }

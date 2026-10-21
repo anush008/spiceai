@@ -30,10 +30,21 @@ pub enum Error {
 
     #[snafu(display(
         "Unsupported Arrow type for a Qdrant payload value: {arrow_type}. \
-        Store the column with a supported type (boolean, integer, float, string, or fixed-size list of floats), \
-        or exclude it from the index payload."
+        Store the column as a boolean, integer, float, decimal, string, date, time, timestamp, \
+        or fixed-size list, or exclude it from the index payload."
     ))]
     UnsupportedPayloadType { arrow_type: String },
+
+    #[snafu(display(
+        "Refused to delete from Qdrant collection '{collection}' with an empty filter, which would delete every point."
+    ))]
+    EmptyDeleteFilter { collection: String },
+
+    #[snafu(display(
+        "A Qdrant payload value does not match the dataset column type {arrow_type}: {detail}. \
+        Recreate the collection so Spice writes it with the current dataset schema."
+    ))]
+    PayloadDecode { arrow_type: String, detail: String },
 
     #[snafu(display(
         "Qdrant collection '{collection}' already exists with {actual}, but the index requires {expected}. \

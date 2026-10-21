@@ -86,6 +86,17 @@ pub trait QdrantStore: Send + Sync + std::fmt::Debug + 'static {
         field_name: &str,
         field_type: qdrant_client::qdrant::FieldType,
     ) -> Result<()>;
+
+    async fn point_ids(&self, collection: &str) -> Result<Vec<qdrant_client::qdrant::PointId>>;
+
+    async fn delete_all(&self, collection: &str) -> Result<()>;
+
+    /// Refuses an empty filter, which Qdrant reads as every point.
+    async fn delete_by_filter(
+        &self,
+        collection: &str,
+        filter: qdrant_client::qdrant::Filter,
+    ) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -260,17 +271,16 @@ impl QdrantStore for Qdrant {
         collection: &str,
         ids: Vec<qdrant_client::qdrant::PointId>,
     ) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
+        for chunk in ids.chunks(crate::DEFAULT_UPSERT_BATCH_SIZE) {
+            let request = qdrant_client::qdrant::DeletePointsBuilder::new(collection)
+                .points(chunk.to_vec())
+                .wait(true)
+                .build();
+            self.client
+                .delete_points(request)
+                .await
+                .map_err(|source| QdrantErr { source })?;
         }
-        let request = qdrant_client::qdrant::DeletePointsBuilder::new(collection)
-            .points(ids)
-            .wait(true)
-            .build();
-        self.client
-            .delete_points(request)
-            .await
-            .map_err(|source| QdrantErr { source })?;
         Ok(())
     }
 
@@ -341,6 +351,67 @@ impl QdrantStore for Qdrant {
             .await
             .map(|_| ())
             .map_err(|source| QdrantErr { source })
+    }
+
+    async fn point_ids(&self, collection: &str) -> Result<Vec<qdrant_client::qdrant::PointId>> {
+        let mut ids = Vec::new();
+        let mut offset = None;
+        loop {
+            let mut request = qdrant_client::qdrant::ScrollPointsBuilder::new(collection)
+                .limit(crate::DEFAULT_SCROLL_PAGE_SIZE)
+                .with_payload(false)
+                .with_vectors(false);
+            if let Some(offset) = offset {
+                request = request.offset(offset);
+            }
+            let page = self
+                .client
+                .scroll(request)
+                .await
+                .map_err(|source| QdrantErr { source })?;
+            ids.extend(page.result.into_iter().filter_map(|point| point.id));
+            match page.next_page_offset {
+                Some(next) => offset = Some(next),
+                None => return Ok(ids),
+            }
+        }
+    }
+
+    async fn delete_by_filter(
+        &self,
+        collection: &str,
+        filter: qdrant_client::qdrant::Filter,
+    ) -> Result<()> {
+        if filter.must.is_empty()
+            && filter.should.is_empty()
+            && filter.must_not.is_empty()
+            && filter.min_should.is_none()
+        {
+            return Err(crate::error::Error::EmptyDeleteFilter {
+                collection: collection.to_string(),
+            });
+        }
+        let request = qdrant_client::qdrant::DeletePointsBuilder::new(collection)
+            .points(filter)
+            .wait(true)
+            .build();
+        self.client
+            .delete_points(request)
+            .await
+            .map_err(|source| QdrantErr { source })?;
+        Ok(())
+    }
+
+    async fn delete_all(&self, collection: &str) -> Result<()> {
+        let request = qdrant_client::qdrant::DeletePointsBuilder::new(collection)
+            .points(qdrant_client::qdrant::Filter::default())
+            .wait(true)
+            .build();
+        self.client
+            .delete_points(request)
+            .await
+            .map_err(|source| QdrantErr { source })?;
+        Ok(())
     }
 }
 

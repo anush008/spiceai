@@ -224,3 +224,64 @@ async fn collection_lifecycle_upsert_search_scroll_delete() {
         Some(&Kind::StringValue("updated".to_string()))
     );
 }
+
+#[tokio::test]
+async fn point_ids_and_filtered_deletes() {
+    let store = connect().await;
+    let collection = unique_collection("spice-qdrant-delete-it");
+    store
+        .ensure_collection(&collection, 2, Distance::Dot)
+        .await
+        .expect("ensure collection");
+    let points: Vec<PointData> = (0..2500)
+        .map(|i| {
+            point(
+                &i.to_string(),
+                vec![1.0, 0.0],
+                if i < 3 { "a" } else { "b" },
+            )
+        })
+        .collect();
+    store
+        .upsert(&collection, points, 0)
+        .await
+        .expect("upsert points");
+
+    let ids = store.point_ids(&collection).await.expect("list point ids");
+    assert_eq!(ids.len(), 2500, "point_ids must page through every point");
+
+    let err = store
+        .delete_by_filter(&collection, Filter::default())
+        .await
+        .expect_err("an empty filter must be refused");
+    assert!(
+        matches!(err, qdrant::Error::EmptyDeleteFilter { .. }),
+        "expected EmptyDeleteFilter, got {err}"
+    );
+    assert_eq!(store.point_ids(&collection).await.expect("ids").len(), 2500);
+
+    let keep = qdrant::payload::point_id_from_values(&["1".to_string()]);
+    let mut remainder = Filter::must([Condition::matches("tag", "a".to_string())]);
+    remainder.must_not.push(Condition::has_id([keep.clone()]));
+    store
+        .delete_by_filter(&collection, remainder)
+        .await
+        .expect("delete the rest of group 'a'");
+    let ids = store.point_ids(&collection).await.expect("ids");
+    assert_eq!(ids.len(), 2498);
+    assert!(ids.contains(&keep));
+    assert!(!ids.contains(&qdrant::payload::point_id_from_values(&["0".to_string()])));
+
+    store
+        .delete_by_ids(&collection, ids)
+        .await
+        .expect("delete more ids than one request carries");
+    assert!(store.point_ids(&collection).await.expect("ids").is_empty());
+
+    store
+        .upsert(&collection, vec![point("x", vec![1.0, 0.0], "a")], 0)
+        .await
+        .expect("upsert");
+    store.delete_all(&collection).await.expect("delete all");
+    assert!(store.point_ids(&collection).await.expect("ids").is_empty());
+}

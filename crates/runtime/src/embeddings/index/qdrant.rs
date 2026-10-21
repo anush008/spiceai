@@ -14,17 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
-use arrow_schema::{DataType, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::Expr;
+use parking_lot::Mutex;
 use qdrant::QdrantStore as _;
 use search::generation::util::get_primary_keys;
 use search::index::chunking::ChunkedSearchIndex;
+use search::index::compound::CompoundVectorIndex;
 pub(crate) use search::index::qdrant::QdrantIndex;
 use search::metadata::{MetadataColumn, MetadataColumns};
+use spice_table::{Index, LayerWalk};
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig, MetadataType},
@@ -51,6 +55,7 @@ pub async fn try_from_table(
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
     partition_by: Vec<Expr>,
+    collections_in_use: &HashMap<String, String>,
 ) -> Result<QdrantIndex, Box<dyn std::error::Error + Send + Sync>> {
     let inner_schema = index_schema;
     let primary_key = derive_primary_keys(&inner_schema, inner_table_provider, ds_name, &config)?;
@@ -72,6 +77,16 @@ pub async fn try_from_table(
             })
             .collect()
     });
+
+    if let Some(other_column) = collections_in_use.get(&collection) {
+        return Err(shared_collection_error(
+            ds_name,
+            &collection,
+            other_column,
+            &column,
+        ));
+    }
+    claim_collection(ds_name, &params.endpoint, &collection)?;
 
     let model = {
         let model_read = embedding_models.read().await;
@@ -95,9 +110,33 @@ pub async fn try_from_table(
         DEFAULT_BATCH_WRITE_ROWS
     };
 
-    let metadata_columns = qdrant_metadata_columns(&dataset_columns, &inner_schema, &column);
+    let partition = qdrant_partition(ds_name, &partition_by, &inner_schema)?;
 
-    let (partition_key, partition_column) = qdrant_partition(&partition_by)?;
+    let metadata_columns = qdrant_metadata_columns(
+        &dataset_columns,
+        &inner_schema,
+        &column,
+        partition
+            .as_ref()
+            .map(|(field, _)| field)
+            .filter(|field| !primary_key.iter().any(|pk| pk.name() == field.name())),
+    );
+
+    let metadata_fields: Vec<_> = metadata_columns.iter().map(MetadataColumn::field).collect();
+    if let Some(field) = primary_key
+        .iter()
+        .chain(metadata_fields.iter().map(AsRef::as_ref))
+        .find(|field| !qdrant::payload::is_storable(field.data_type()))
+    {
+        return Err(config_error(
+            ds_name,
+            &format!(
+                "Column '{}' has type {}, which Qdrant cannot store as a payload value. Remove it from `row_id` or the vector metadata columns, or cast it to a supported type in a view.",
+                field.name(),
+                field.data_type()
+            ),
+        ));
+    }
 
     ensure_collection(
         client.as_ref(),
@@ -110,13 +149,9 @@ pub async fn try_from_table(
     )
     .await?;
 
-    if let Some(partition_key) = &partition_key {
+    if let Some((field, field_type)) = &partition {
         client
-            .create_field_index(
-                &collection,
-                partition_key,
-                qdrant::proto::FieldType::Keyword,
-            )
+            .create_field_index(&collection, field.name(), *field_type)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
     }
@@ -135,39 +170,137 @@ pub async fn try_from_table(
             .to_string(),
         metadata_columns,
         batch_write_rows,
-        partition_key: partition_key.clone(),
-        partition_column,
+        replace_window: Arc::default(),
     })
 }
 
-fn qdrant_partition(
-    partition_by: &[Expr],
-) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
-    match partition_by.first() {
-        None => Ok((None, None)),
-        Some(partition_expr) => {
-            if partition_by.len() > 1 {
-                return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "Qdrant partition_by supports at most one expression, but {} were provided",
-                    partition_by.len()
-                )));
-            }
-            let name = expr_column_name(partition_expr).ok_or_else(
-                || -> Box<dyn std::error::Error + Send + Sync> {
-                    "Qdrant partition_by must reference a single column".into()
-                },
-            )?;
-            Ok((Some(format!("spice_partition_{name}")), Some(name)))
+pub(crate) fn collections_in_use(provider: &Arc<dyn TableProvider>) -> HashMap<String, String> {
+    fn qdrant_index(index: &dyn Index) -> Option<&QdrantIndex> {
+        let any = index.as_any();
+        if let Some(chunked) = any.downcast_ref::<ChunkedSearchIndex>() {
+            return qdrant_index(chunked.inner().as_ref());
         }
+        if let Some(compound) = any.downcast_ref::<CompoundVectorIndex>() {
+            return qdrant_index(compound.secondary().as_ref());
+        }
+        any.downcast_ref::<QdrantIndex>()
     }
+
+    spice_table::nodes(provider.as_ref(), LayerWalk::Index)
+        .flat_map(|node| node.indexes().iter())
+        .filter_map(|index| qdrant_index(index.as_ref()))
+        .map(|index| (index.collection.clone(), index.embedded_column.clone()))
+        .collect()
 }
 
-fn expr_column_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Column(col) => Some(col.name.clone()),
-        Expr::Alias(alias) => Some(alias.name.clone()),
-        _ => None,
+static DATASET_COLLECTIONS: LazyLock<Mutex<HashMap<(String, String), String>>> =
+    LazyLock::new(Mutex::default);
+
+fn claim_collection(
+    ds_name: &TableReference,
+    endpoint: &str,
+    collection: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let owner = ds_name.to_string();
+    let mut claims = DATASET_COLLECTIONS.lock();
+    let key = (
+        endpoint.trim_end_matches('/').to_string(),
+        collection.to_string(),
+    );
+    if let Some(other) = claims.get(&key)
+        && *other != owner
+    {
+        return Err(config_error(
+            ds_name,
+            &format!(
+                "Qdrant collection '{collection}' already holds the vectors of dataset {other}, and each refresh of one dataset would remove the other's vectors. Set a different `qdrant_collection`. If dataset {other} was renamed or removed, restart the runtime."
+            ),
+        ));
     }
+    claims.insert(key, owner);
+    Ok(())
+}
+
+fn config_error(
+    ds_name: &TableReference,
+    detail: &str,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    format!(
+        "Failed to register dataset {ds_name} (qdrant): {detail} See: https://spiceai.org/docs/components/vectors"
+    )
+    .into()
+}
+
+fn shared_collection_error(
+    ds_name: &TableReference,
+    collection: &str,
+    other_column: &str,
+    column: &str,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    config_error(
+        ds_name,
+        &format!(
+            "Columns '{other_column}' and '{column}' would write to the same Qdrant collection '{collection}' and overwrite each other's vectors. Remove `qdrant_collection` so each column gets its own collection."
+        ),
+    )
+}
+
+fn qdrant_partition(
+    ds_name: &TableReference,
+    partition_by: &[Expr],
+    schema: &Schema,
+) -> Result<Option<(Field, qdrant::proto::FieldType)>, Box<dyn std::error::Error + Send + Sync>> {
+    let [partition_expr] = partition_by else {
+        if partition_by.is_empty() {
+            return Ok(None);
+        }
+        return Err(config_error(
+            ds_name,
+            &format!(
+                "`partition_by` supports one column, but {} expressions were provided.",
+                partition_by.len()
+            ),
+        ));
+    };
+    let Expr::Column(column) = partition_expr else {
+        return Err(config_error(
+            ds_name,
+            &format!("`partition_by` must be a column name, but found '{partition_expr}'."),
+        ));
+    };
+    let field = schema.field_with_name(&column.name)?;
+    let field_type = match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            qdrant::proto::FieldType::Keyword
+        }
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => qdrant::proto::FieldType::Integer,
+        DataType::Float32 | DataType::Float64 => qdrant::proto::FieldType::Float,
+        DataType::Boolean => qdrant::proto::FieldType::Bool,
+        DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(
+            TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond,
+            _,
+        ) => qdrant::proto::FieldType::Datetime,
+        other if qdrant::payload::is_string_encoded(other) => qdrant::proto::FieldType::Keyword,
+        other => {
+            return Err(config_error(
+                ds_name,
+                &format!(
+                    "`partition_by` column '{}' has type {other}, which Qdrant cannot index. Use a string, number, boolean, decimal, date, time, or timestamp column.",
+                    column.name
+                ),
+            ));
+        }
+    };
+    Ok(Some((field.clone(), field_type)))
 }
 
 const DEFAULT_BATCH_WRITE_ROWS: usize = 1000;
@@ -176,8 +309,9 @@ fn qdrant_metadata_columns(
     columns: &[Column],
     schema: &SchemaRef,
     embedded_column: &str,
+    partition_column: Option<&Field>,
 ) -> MetadataColumns {
-    let cols: Vec<MetadataColumn> = columns
+    let mut cols: Vec<MetadataColumn> = columns
         .iter()
         .filter(|c| c.name != embedded_column)
         .filter_map(|c| {
@@ -189,6 +323,12 @@ fn qdrant_metadata_columns(
             })
         })
         .collect();
+    if let Some(field) = partition_column
+        && field.name() != embedded_column
+        && !cols.iter().any(|c| c.name() == field.name())
+    {
+        cols.push(MetadataColumn::Filterable(Arc::new(field.clone())));
+    }
     cols.into()
 }
 
@@ -285,19 +425,80 @@ fn derive_primary_keys(
 
 #[cfg(test)]
 mod tests {
-    use super::qdrant_partition;
-    use datafusion::prelude::col;
+    use super::{qdrant_metadata_columns, qdrant_partition, shared_collection_error};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
+    use datafusion::prelude::{Expr, col, lit};
+    use qdrant::proto::FieldType;
+
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, true),
+            Field::new("year", DataType::Int32, true),
+            Field::new("created_at", DataType::Date32, true),
+            Field::new("blob", DataType::Binary, true),
+        ])
+    }
+
+    fn partition(partition_by: &[Expr]) -> Result<Option<(String, FieldType)>, String> {
+        qdrant_partition(&TableReference::bare("docs"), partition_by, &schema())
+            .map(|p| p.map(|(field, field_type)| (field.name().clone(), field_type)))
+            .map_err(|e| e.to_string())
+    }
 
     #[test]
-    fn qdrant_partition_behavior() {
-        let (key, column) = qdrant_partition(&[col("tenant_id")]).expect("partition");
-        assert_eq!(key.as_deref(), Some("spice_partition_tenant_id"));
-        assert_eq!(column.as_deref(), Some("tenant_id"));
+    fn qdrant_partition_resolves_an_indexable_column() {
+        assert_eq!(partition(&[]), Ok(None));
+        assert_eq!(
+            partition(&[col("tenant_id")]),
+            Ok(Some(("tenant_id".to_string(), FieldType::Keyword)))
+        );
+        assert_eq!(
+            partition(&[col("year")]),
+            Ok(Some(("year".to_string(), FieldType::Integer)))
+        );
+        assert_eq!(
+            partition(&[col("year"), col("tenant_id")]),
+            Err("Failed to register dataset docs (qdrant): `partition_by` supports one column, but 2 expressions were provided. See: https://spiceai.org/docs/components/vectors".to_string())
+        );
+        assert_eq!(
+            partition(&[col("year") + lit(1)]),
+            Err("Failed to register dataset docs (qdrant): `partition_by` must be a column name, but found 'year + Int32(1)'. See: https://spiceai.org/docs/components/vectors".to_string())
+        );
+        assert_eq!(
+            partition(&[col("created_at")]),
+            Err("Failed to register dataset docs (qdrant): `partition_by` column 'created_at' has type Date32, which Qdrant cannot index. Use a string, number, boolean, decimal, date, time, or timestamp column. See: https://spiceai.org/docs/components/vectors".to_string())
+        );
+    }
 
-        let (key, column) = qdrant_partition(&[]).expect("partition");
-        assert!(key.is_none());
-        assert!(column.is_none());
+    #[test]
+    fn partition_column_is_a_payload_column_once() {
+        let schema = std::sync::Arc::new(schema());
+        let tenant = schema
+            .field_with_name("tenant_id")
+            .expect("tenant_id")
+            .clone();
+        let declared = spicepod::semantic::Column::new("tenant_id").with_metadata(
+            [(
+                "vectors".to_string(),
+                serde_json::Value::String("non-filterable".to_string()),
+            )]
+            .into(),
+        );
+        for columns in [vec![], vec![declared]] {
+            assert_eq!(
+                qdrant_metadata_columns(&columns, &schema, "body", Some(&tenant)).all_names(),
+                vec!["tenant_id".to_string()]
+            );
+        }
+    }
 
-        assert!(qdrant_partition(&[col("a"), col("b")]).is_err());
+    #[test]
+    fn shared_collection_error_names_both_columns_and_the_fix() {
+        assert_eq!(
+            shared_collection_error(&TableReference::bare("docs"), "shared", "title", "body")
+                .to_string(),
+            "Failed to register dataset docs (qdrant): Columns 'title' and 'body' would write to the same Qdrant collection 'shared' and overwrite each other's vectors. Remove `qdrant_collection` so each column gets its own collection. See: https://spiceai.org/docs/components/vectors"
+        );
     }
 }
