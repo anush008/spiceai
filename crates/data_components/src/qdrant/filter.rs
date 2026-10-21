@@ -576,7 +576,7 @@ mod tests {
         let before_epoch = range(&col("id").lt(lit(ScalarValue::Date32(Some(-1)))));
         assert_eq!(
             before_epoch.lt,
-            Some((SystemTime::UNIX_EPOCH - Duration::from_secs(86_400)).into())
+            Some((SystemTime::UNIX_EPOCH - Duration::from_hours(24)).into())
         );
 
         assert!(!supports(

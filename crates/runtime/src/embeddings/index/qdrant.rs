@@ -44,7 +44,7 @@ use runtime_search::store_params::qdrant::{
 use runtime_secrets::{Secrets, get_params_with_secrets};
 
 #[expect(clippy::too_many_arguments)]
-pub async fn try_from_table(
+pub async fn try_from_table<S: std::hash::BuildHasher>(
     ds_name: &TableReference,
     column: String,
     config: ColumnLevelEmbeddingConfig,
@@ -55,7 +55,7 @@ pub async fn try_from_table(
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
     partition_by: Vec<Expr>,
-    collections_in_use: &HashMap<String, String>,
+    collections_in_use: &HashMap<String, String, S>,
 ) -> Result<QdrantIndex, Box<dyn std::error::Error + Send + Sync>> {
     let inner_schema = index_schema;
     let primary_key = derive_primary_keys(&inner_schema, inner_table_provider, ds_name, &config)?;
@@ -467,7 +467,11 @@ mod tests {
         );
         assert_eq!(
             partition(&[col("created_at")]),
-            Err("Failed to register dataset docs (qdrant): `partition_by` column 'created_at' has type Date32, which Qdrant cannot index. Use a string, number, boolean, decimal, date, time, or timestamp column. See: https://spiceai.org/docs/components/vectors".to_string())
+            Ok(Some(("created_at".to_string(), FieldType::Datetime)))
+        );
+        assert_eq!(
+            partition(&[col("blob")]),
+            Err("Failed to register dataset docs (qdrant): `partition_by` column 'blob' has type Binary, which Qdrant cannot index. Use a string, number, boolean, decimal, date, time, or timestamp column. See: https://spiceai.org/docs/components/vectors".to_string())
         );
     }
 
