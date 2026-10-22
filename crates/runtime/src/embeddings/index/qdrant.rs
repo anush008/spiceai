@@ -15,13 +15,12 @@ limitations under the License.
 */
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::Expr;
-use parking_lot::Mutex;
 use qdrant::QdrantStore as _;
 use search::generation::util::get_primary_keys;
 use search::index::chunking::ChunkedSearchIndex;
@@ -86,7 +85,6 @@ pub async fn try_from_table<S: std::hash::BuildHasher>(
             &column,
         ));
     }
-    claim_collection(ds_name, &params.endpoint, &collection)?;
 
     let model = {
         let model_read = embedding_models.read().await;
@@ -138,6 +136,21 @@ pub async fn try_from_table<S: std::hash::BuildHasher>(
         ));
     }
 
+    if let Some(name) = primary_key
+        .iter()
+        .chain(metadata_fields.iter().map(AsRef::as_ref))
+        .map(|field| field.name().as_str())
+        .find(|name| qdrant::payload::RESERVED_KEYS.contains(name))
+    {
+        return Err(config_error(
+            ds_name,
+            &format!(
+                "Column '{name}' uses a payload key Spice writes on every Qdrant point ({}). Rename the column in a view, or remove it from `row_id` or the vector metadata columns.",
+                qdrant::payload::RESERVED_KEYS.join(", ")
+            ),
+        ));
+    }
+
     ensure_collection(
         client.as_ref(),
         &collection,
@@ -149,9 +162,21 @@ pub async fn try_from_table<S: std::hash::BuildHasher>(
     )
     .await?;
 
-    if let Some((field, field_type)) = &partition {
+    // Every search filters on the dataset, so it is indexed. The generation is read only by the
+    // one cleanup delete per full refresh, which the dataset index already narrows, so it is
+    // left unindexed rather than paying for index upkeep on every upsert.
+    let indexed_fields = std::iter::once((
+        qdrant::payload::DATASET_KEY,
+        qdrant::proto::FieldType::Keyword,
+    ))
+    .chain(
+        partition
+            .as_ref()
+            .map(|(field, field_type)| (field.name().as_str(), *field_type)),
+    );
+    for (field_name, field_type) in indexed_fields {
         client
-            .create_field_index(&collection, field.name(), *field_type)
+            .create_field_index(&collection, field_name, field_type)
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
     }
@@ -170,7 +195,8 @@ pub async fn try_from_table<S: std::hash::BuildHasher>(
             .to_string(),
         metadata_columns,
         batch_write_rows,
-        replace_window: Arc::default(),
+        dataset: ds_name.to_string(),
+        write_generation: Arc::default(),
     })
 }
 
@@ -191,34 +217,6 @@ pub(crate) fn collections_in_use(provider: &Arc<dyn TableProvider>) -> HashMap<S
         .filter_map(|index| qdrant_index(index.as_ref()))
         .map(|index| (index.collection.clone(), index.embedded_column.clone()))
         .collect()
-}
-
-static DATASET_COLLECTIONS: LazyLock<Mutex<HashMap<(String, String), String>>> =
-    LazyLock::new(Mutex::default);
-
-fn claim_collection(
-    ds_name: &TableReference,
-    endpoint: &str,
-    collection: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let owner = ds_name.to_string();
-    let mut claims = DATASET_COLLECTIONS.lock();
-    let key = (
-        endpoint.trim_end_matches('/').to_string(),
-        collection.to_string(),
-    );
-    if let Some(other) = claims.get(&key)
-        && *other != owner
-    {
-        return Err(config_error(
-            ds_name,
-            &format!(
-                "Qdrant collection '{collection}' already holds the vectors of dataset {other}, and each refresh of one dataset would remove the other's vectors. Set a different `qdrant_collection`. If dataset {other} was renamed or removed, restart the runtime."
-            ),
-        ));
-    }
-    claims.insert(key, owner);
-    Ok(())
 }
 
 fn config_error(
@@ -268,7 +266,15 @@ fn qdrant_partition(
             &format!("`partition_by` must be a column name, but found '{partition_expr}'."),
         ));
     };
-    let field = schema.field_with_name(&column.name)?;
+    let Ok(field) = schema.field_with_name(&column.name) else {
+        return Err(config_error(
+            ds_name,
+            &format!(
+                "`partition_by` names column '{}', which the dataset does not have. Use one of the dataset's columns.",
+                column.name
+            ),
+        ));
+    };
     let field_type = match field.data_type() {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             qdrant::proto::FieldType::Keyword
@@ -468,6 +474,10 @@ mod tests {
         assert_eq!(
             partition(&[col("created_at")]),
             Ok(Some(("created_at".to_string(), FieldType::Datetime)))
+        );
+        assert_eq!(
+            partition(&[col("tenant")]),
+            Err("Failed to register dataset docs (qdrant): `partition_by` names column 'tenant', which the dataset does not have. Use one of the dataset's columns. See: https://spiceai.org/docs/components/vectors".to_string())
         );
         assert_eq!(
             partition(&[col("blob")]),

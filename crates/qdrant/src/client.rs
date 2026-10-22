@@ -78,6 +78,7 @@ pub trait QdrantStore: Send + Sync + std::fmt::Debug + 'static {
         collection: &str,
         page_size: u32,
         offset: Option<qdrant_client::qdrant::PointId>,
+        filter: Option<qdrant_client::qdrant::Filter>,
     ) -> Result<ScrollPage>;
 
     async fn create_field_index(
@@ -86,10 +87,6 @@ pub trait QdrantStore: Send + Sync + std::fmt::Debug + 'static {
         field_name: &str,
         field_type: qdrant_client::qdrant::FieldType,
     ) -> Result<()>;
-
-    async fn point_ids(&self, collection: &str) -> Result<Vec<qdrant_client::qdrant::PointId>>;
-
-    async fn delete_all(&self, collection: &str) -> Result<()>;
 
     /// Refuses an empty filter, which Qdrant reads as every point.
     async fn delete_by_filter(
@@ -232,11 +229,19 @@ impl QdrantStore for Qdrant {
             }),
             ..Default::default()
         };
-        self.client
-            .create_collection(request)
-            .await
-            .map_err(|source| QdrantErr { source })?;
-        Ok(())
+        match self.client.create_collection(request).await {
+            Ok(_) => Ok(()),
+            // Another writer, such as a second dataset loading at the same time, created the
+            // collection after the existence check. Accept it when its parameters match.
+            Err(source) => {
+                if self.collection_exists(collection).await? {
+                    self.validate_collection(collection, dimension, distance)
+                        .await
+                } else {
+                    Err(QdrantErr { source })
+                }
+            }
+        }
     }
 
     async fn upsert(
@@ -311,6 +316,7 @@ impl QdrantStore for Qdrant {
         collection: &str,
         page_size: u32,
         offset: Option<qdrant_client::qdrant::PointId>,
+        filter: Option<qdrant_client::qdrant::Filter>,
     ) -> Result<ScrollPage> {
         let page_size = if page_size == 0 {
             crate::DEFAULT_SCROLL_PAGE_SIZE
@@ -323,6 +329,9 @@ impl QdrantStore for Qdrant {
             .with_vectors(true);
         if let Some(offset) = offset {
             request = request.offset(offset);
+        }
+        if let Some(filter) = filter {
+            request = request.filter(filter);
         }
         let page = self
             .client
@@ -353,30 +362,6 @@ impl QdrantStore for Qdrant {
             .map_err(|source| QdrantErr { source })
     }
 
-    async fn point_ids(&self, collection: &str) -> Result<Vec<qdrant_client::qdrant::PointId>> {
-        let mut ids = Vec::new();
-        let mut offset = None;
-        loop {
-            let mut request = qdrant_client::qdrant::ScrollPointsBuilder::new(collection)
-                .limit(crate::DEFAULT_SCROLL_PAGE_SIZE)
-                .with_payload(false)
-                .with_vectors(false);
-            if let Some(offset) = offset {
-                request = request.offset(offset);
-            }
-            let page = self
-                .client
-                .scroll(request)
-                .await
-                .map_err(|source| QdrantErr { source })?;
-            ids.extend(page.result.into_iter().filter_map(|point| point.id));
-            match page.next_page_offset {
-                Some(next) => offset = Some(next),
-                None => return Ok(ids),
-            }
-        }
-    }
-
     async fn delete_by_filter(
         &self,
         collection: &str,
@@ -393,18 +378,6 @@ impl QdrantStore for Qdrant {
         }
         let request = qdrant_client::qdrant::DeletePointsBuilder::new(collection)
             .points(filter)
-            .wait(true)
-            .build();
-        self.client
-            .delete_points(request)
-            .await
-            .map_err(|source| QdrantErr { source })?;
-        Ok(())
-    }
-
-    async fn delete_all(&self, collection: &str) -> Result<()> {
-        let request = qdrant_client::qdrant::DeletePointsBuilder::new(collection)
-            .points(qdrant_client::qdrant::Filter::default())
             .wait(true)
             .build();
         self.client
